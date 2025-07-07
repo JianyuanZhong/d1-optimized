@@ -136,8 +136,8 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
         # Add Monte Carlo specific parameters
         if monte_carlo_loss or hybrid_loss:
             loss_kwargs.update({
-                'mc_num': getattr(args, 'mc_num', 128),
-                'mc_batch_size': getattr(args, 'mc_batch_size', 16),
+                'mc_num': getattr(args, 'mc_num', 128),  # Keep for accuracy
+                'mc_batch_size': getattr(args, 'mc_batch_size', 8),  # Reduced from 16 to 8 for memory
                 'cfg_scale': getattr(args, 'cfg_scale', 0.0),
                 'mask_id': getattr(args, 'mask_id', 126336)
             })

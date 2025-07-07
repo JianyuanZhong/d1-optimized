@@ -327,6 +327,9 @@ class MonteCarloGRPOLoss(GRPOLoss):
         if self.mc_num % self.mc_batch_size != 0:
             raise ValueError(f"mc_num ({self.mc_num}) must be divisible by mc_batch_size ({self.mc_batch_size})")
         
+        # Adaptive batch size based on memory
+        self.adaptive_mc_batch_size = self._get_adaptive_mc_batch_size()
+        
         if self.mc_num_old_logps % self.mc_batch_size != 0:
             # Adjust mc_num_old_logps to be divisible by mc_batch_size
             self.mc_num_old_logps = (self.mc_num_old_logps // self.mc_batch_size) * self.mc_batch_size
@@ -368,8 +371,9 @@ class MonteCarloGRPOLoss(GRPOLoss):
         prompt_mask = torch.zeros(b, prompt_index.sum(), dtype=torch.bool, device=device)
         is_mask = torch.cat((prompt_mask, is_mask), dim=1)
         
-        # Apply masking
-        noisy_batch = torch.where(is_mask, mask_id, batch)
+        # Apply masking in-place for memory efficiency
+        noisy_batch = batch.clone()
+        noisy_batch.masked_fill_(is_mask, mask_id)
         
         # Return mask ratio for each token
         mask_ratio = (x / target_len).unsqueeze(1).repeat(1, l)
@@ -383,35 +387,59 @@ class MonteCarloGRPOLoss(GRPOLoss):
                             cfg_scale: float, mask_id: int) -> torch.Tensor:
         """Get logits with classifier-free guidance if enabled."""
         if cfg_scale > 0.0:
-            # Create unconditioned batch by masking the prompt
-            un_batch = batch.clone()
-            un_batch[:, prompt_index] = mask_id
-            
-            # Combine conditional and unconditional batches
-            combined_batch = torch.cat([batch, un_batch])
-            
-            # Forward pass
-            if self.enable_mixed_precision:
-                with torch.cuda.amp.autocast():
-                    logits = model(combined_batch).logits
-            else:
-                logits = model(combined_batch).logits
-            
-            # Split and apply CFG
-            cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
-            logits = uncond_logits + (cfg_scale + 1) * (cond_logits - uncond_logits)
-            
-            # Clean up intermediate tensors
-            batch_tensor_cleanup(un_batch, combined_batch, cond_logits, uncond_logits, force_cache_clear=False)
+            # Memory-optimized sequential CFG processing
+            return self._get_logits_with_cfg_sequential(model, batch, prompt_index, cfg_scale, mask_id)
         else:
-            # Standard forward pass
-            if self.enable_mixed_precision:
-                with torch.cuda.amp.autocast():
-                    logits = model(batch).logits
-            else:
-                logits = model(batch).logits
+            # Standard forward pass with gradient checkpointing
+            return self._get_logits_standard(model, batch)
+    
+    def _get_logits_with_cfg_sequential(self, model, batch: torch.Tensor, prompt_index: torch.Tensor, 
+                                      cfg_scale: float, mask_id: int) -> torch.Tensor:
+        """Sequential CFG processing to halve memory usage."""
+        # Process conditional batch first
+        if self.enable_mixed_precision:
+            with torch.cuda.amp.autocast():
+                cond_logits = torch.utils.checkpoint.checkpoint(
+                    lambda x: model(x).logits, batch, use_reentrant=False
+                )
+        else:
+            cond_logits = torch.utils.checkpoint.checkpoint(
+                lambda x: model(x).logits, batch, use_reentrant=False
+            )
+        
+        # Process unconditional batch separately
+        un_batch = batch.clone()
+        un_batch[:, prompt_index] = mask_id
+        
+        if self.enable_mixed_precision:
+            with torch.cuda.amp.autocast():
+                uncond_logits = torch.utils.checkpoint.checkpoint(
+                    lambda x: model(x).logits, un_batch, use_reentrant=False
+                )
+        else:
+            uncond_logits = torch.utils.checkpoint.checkpoint(
+                lambda x: model(x).logits, un_batch, use_reentrant=False
+            )
+        
+        # Apply CFG
+        logits = uncond_logits + (cfg_scale + 1) * (cond_logits - uncond_logits)
+        
+        # Clean up intermediate tensors
+        batch_tensor_cleanup(un_batch, cond_logits, uncond_logits, force_cache_clear=False)
         
         return logits
+    
+    def _get_logits_standard(self, model, batch: torch.Tensor) -> torch.Tensor:
+        """Standard forward pass with gradient checkpointing."""
+        if self.enable_mixed_precision:
+            with torch.cuda.amp.autocast():
+                return torch.utils.checkpoint.checkpoint(
+                    lambda x: model(x).logits, batch, use_reentrant=False
+                )
+        else:
+            return torch.utils.checkpoint.checkpoint(
+                lambda x: model(x).logits, batch, use_reentrant=False
+            )
     
     @torch.no_grad()
     def _monte_carlo_log_likelihood(self, model, prompt_ids: torch.Tensor, 
@@ -430,16 +458,17 @@ class MonteCarloGRPOLoss(GRPOLoss):
         # Create prompt index mask
         prompt_index = torch.arange(seq_len, device=device) < prompt_ids.size(1)
         
-        # Process in smaller chunks to reduce memory usage
-        num_mc_batches = mc_num // self.mc_batch_size
+        # Use adaptive batch size for memory efficiency
+        effective_batch_size = min(self.adaptive_mc_batch_size, self.mc_batch_size)
+        num_mc_batches = mc_num // effective_batch_size
         
         # Accumulate losses more efficiently
         total_loss = 0.0
         total_samples = 0
         
         for batch_idx in range(num_mc_batches):
-            # Create smaller batch for this iteration
-            seq_batch = seq.repeat(self.mc_batch_size, 1)
+            # Create smaller batch for this iteration with adaptive batch size
+            seq_batch = seq.repeat(effective_batch_size, 1)
             
             # Apply Monte Carlo forward process
             perturbed_seq, p_mask = self._monte_carlo_forward_process(
@@ -479,8 +508,17 @@ class MonteCarloGRPOLoss(GRPOLoss):
             # Clean up intermediate tensors immediately after each batch
             batch_tensor_cleanup(
                 seq_batch, perturbed_seq, p_mask, logits, loss, 
-                force_cache_clear=(batch_idx % 4 == 0)  # Clear cache every 4 batches
+                force_cache_clear=(batch_idx % 2 == 0)  # More aggressive: clear cache every 2 batches
             )
+            
+            # Additional memory cleanup for Monte Carlo batches
+            if batch_idx % 4 == 0:  # Every 4 batches, do aggressive cleanup
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                # Clear memory manager cache if available
+                if hasattr(self, 'memory_manager') and self.memory_manager is not None:
+                    self.memory_manager.cleanup_batch_tensors()
         
         # Return average negative log-likelihood (positive value)
         if total_samples > 0:
@@ -538,6 +576,30 @@ class MonteCarloGRPOLoss(GRPOLoss):
             batch_tensor_cleanup(iteration_input, prompt_seq, completion_seq, force_cache_clear=True)
         
         return per_token_logps
+    
+    def _get_adaptive_mc_batch_size(self) -> int:
+        """Determine adaptive Monte Carlo batch size based on available memory."""
+        if not torch.cuda.is_available():
+            return min(4, self.mc_batch_size)
+        
+        try:
+            # Get available GPU memory in GB
+            available_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            free_memory, total_memory = torch.cuda.mem_get_info()
+            free_memory_gb = free_memory / (1024**3)
+            
+            # Conservative memory-aware batch sizing
+            if free_memory_gb < 8:
+                return min(4, self.mc_batch_size)
+            elif free_memory_gb < 16:
+                return min(8, self.mc_batch_size)
+            elif free_memory_gb < 32:
+                return min(12, self.mc_batch_size)
+            else:
+                return self.mc_batch_size
+        except Exception:
+            # Fallback to conservative batch size
+            return min(4, self.mc_batch_size)
     
     def _compute_per_token_logps(self, model, input_ids: torch.Tensor, 
                                logits_to_keep: int, mask_seeds: List[int]) -> torch.Tensor:
