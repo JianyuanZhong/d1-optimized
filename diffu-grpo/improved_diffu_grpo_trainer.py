@@ -22,6 +22,7 @@ from trl.trainer.utils import (
     selective_log_softmax,
 )
 import wandb
+import pandas as pd
 
 # Import our new modular components
 from core.memory_manager import MemoryManager
@@ -194,6 +195,9 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
             'train': {},
             'eval': {}
         }
+        
+        # Initialize logging configuration
+        self.log_completions = getattr(args, 'log_completions', True)
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -391,6 +395,14 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
             prompts, completions, inputs, device
         )
 
+        # Log rewards and completions
+        rewards_per_func = None
+        if hasattr(self, '_last_rewards_per_func'):
+            rewards_per_func = self._last_rewards_per_func
+        self._log_rewards_and_completions(
+            prompts, completions, rewards, rewards_per_func, completion_mask, mode="train"
+        )
+
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -461,6 +473,9 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
 
             rewards_per_func = gather(rewards_per_func)
             rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+            
+            # Store for logging
+            self._last_rewards_per_func = rewards_per_func
 
         # Compute advantages efficiently
         grouped_rewards = rewards.view(-1, self.num_generations)
@@ -479,6 +494,84 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
         advantages = advantages[process_slice]
         
         return rewards, advantages
+
+    def _log_rewards_and_completions(self, prompts, completions, rewards, rewards_per_func=None, completion_mask=None, mode="train"):
+        """Log rewards and completions to console and wandb."""
+        if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
+            # Gather data for logging
+            prompts_text = prompts if isinstance(prompts[0], str) else [p[0]["content"] for p in prompts]
+            completions_text = completions if isinstance(completions[0], str) else [c[0]["content"] for c in completions]
+            
+            prompts_to_log = gather_object(prompts_text)
+            completions_to_log = gather_object(completions_text)
+            rewards_to_log = rewards.tolist()
+            
+            # Log reward function metrics
+            if rewards_per_func is not None:
+                for i, reward_func in enumerate(self.reward_funcs):
+                    if isinstance(reward_func, nn.Module):
+                        reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+                    else:
+                        reward_func_name = reward_func.__name__
+                    mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+                    if mode not in self._metrics:
+                        self._metrics[mode] = {}
+                    if f"rewards/{reward_func_name}" not in self._metrics[mode]:
+                        self._metrics[mode][f"rewards/{reward_func_name}"] = []
+                    self._metrics[mode][f"rewards/{reward_func_name}"].append(mean_rewards)
+            
+            # Log completion metrics
+            if completion_mask is not None:
+                completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
+                if "completion_length" not in self._metrics[mode]:
+                    self._metrics[mode]["completion_length"] = []
+                self._metrics[mode]["completion_length"].append(completion_length)
+            
+            # Log reward statistics
+            if "reward" not in self._metrics[mode]:
+                self._metrics[mode]["reward"] = []
+            self._metrics[mode]["reward"].append(rewards.mean().item())
+            
+            if "reward_std" not in self._metrics[mode]:
+                self._metrics[mode]["reward_std"] = []
+            grouped_rewards = rewards.view(-1, self.num_generations)
+            std_grouped_rewards = grouped_rewards.std(dim=1)
+            self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+            
+            # Zero std ratio
+            zero_std_ratio = (std_grouped_rewards == 0).float().mean().item()
+            if "zero_std_ratio" not in self._metrics[mode]:
+                self._metrics[mode]["zero_std_ratio"] = []
+            self._metrics[mode]["zero_std_ratio"].append(zero_std_ratio)
+            
+            if self.accelerator.is_main_process:
+                # Console logging
+                if is_rich_available():
+                    print_prompt_completions_sample(
+                        prompts_to_log,
+                        completions_to_log,
+                        rewards_to_log,
+                        self.state.global_step,
+                    )
+                
+                # wandb logging
+                if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+                    table = {
+                        "step": [str(self.state.global_step)] * len(rewards),
+                        "prompt": prompts_to_log,
+                        "completion": completions_to_log,
+                        "reward": rewards.tolist(),
+                    }
+                    df = pd.DataFrame(table)
+                    wandb.log({"completions": wandb.Table(dataframe=df)})
+                    
+                    # Log metrics to wandb
+                    wandb_metrics = {}
+                    for metric_name, values in self._metrics[mode].items():
+                        if values:
+                            wandb_metrics[f"{mode}/{metric_name}"] = values[-1]
+                    if wandb_metrics:
+                        wandb.log(wandb_metrics)
 
     def get_performance_stats(self) -> Dict[str, Any]:
         """Get comprehensive performance statistics."""
