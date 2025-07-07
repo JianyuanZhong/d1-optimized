@@ -27,7 +27,7 @@ import wandb
 from core.memory_manager import MemoryManager
 from core.diffusion_generator import DiffusionGenerator
 from core.masking_strategy import create_masking_strategy, DiffusionMaskingStrategy
-from core.grpo_loss import GRPOLoss, AdaptiveGRPOLoss
+from core.grpo_loss import GRPOLoss, AdaptiveGRPOLoss, MonteCarloGRPOLoss, HybridGRPOLoss
 from core.reward_functions import RewardFunctionManager, create_reward_functions
 from core.tensor_ops import TensorOpsOptimizer, MemoryEfficientOperations
 
@@ -81,7 +81,12 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
         enable_profiling: bool = False,
         masking_strategy: str = "diffusion",
         adaptive_loss: bool = False,
+        monte_carlo_loss: bool = False,
+        hybrid_loss: bool = False,
     ):
+        # Ensure beta is never 0 - override parent class setting
+        self.beta = max(getattr(args, 'beta', 0.04), 0.01)
+        logger.info(f"Beta coefficient set to: {self.beta} (ensured non-zero)")
         # Initialize the parent class
         super().__init__(
             model=model,
@@ -96,8 +101,13 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
             peft_config=peft_config,
         )
         
-        # Initialize our modular components
-        self.memory_manager = MemoryManager(enable_profiling=enable_profiling)
+        # Initialize our modular components with optimized memory management
+        # For Monte Carlo operations, we need more frequent cache clearing
+        cache_clear_interval = getattr(args, 'memory_cache_interval', 20)  # More frequent for MC operations
+        self.memory_manager = MemoryManager(
+            enable_profiling=enable_profiling, 
+            cache_clear_interval=cache_clear_interval
+        )
         self.tensor_ops = TensorOpsOptimizer(device=self.accelerator.device)
         
         # Initialize masking strategy
@@ -113,22 +123,49 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
             enable_mixed_precision=getattr(args, 'fp16', False) or getattr(args, 'bf16', False)
         )
         
-        # Initialize GRPO loss
-        if adaptive_loss:
-            self.grpo_loss = AdaptiveGRPOLoss(
-                masking_strategy=self.masking_strategy,
-                memory_manager=self.memory_manager,
-                initial_epsilon=getattr(args, 'epsilon', 0.2),
-                initial_beta=getattr(args, 'beta', 0.04),
-                total_steps=args.max_steps if hasattr(args, 'max_steps') else 10000
+        # Initialize GRPO loss with Monte Carlo support
+        loss_kwargs = {
+            'masking_strategy': self.masking_strategy,
+            'memory_manager': self.memory_manager,
+            'epsilon': getattr(args, 'epsilon', 0.2),
+            'beta': max(getattr(args, 'beta', 0.04), 0.01),  # Ensure beta is never 0, minimum 0.01
+            'enable_mixed_precision': getattr(args, 'fp16', False) or getattr(args, 'bf16', False)
+        }
+        
+        # Add Monte Carlo specific parameters
+        if monte_carlo_loss or hybrid_loss:
+            loss_kwargs.update({
+                'mc_num': getattr(args, 'mc_num', 128),
+                'mc_batch_size': getattr(args, 'mc_batch_size', 16),
+                'cfg_scale': getattr(args, 'cfg_scale', 0.0),
+                'mask_id': getattr(args, 'mask_id', 126336)
+            })
+        
+        # Initialize the appropriate loss class
+        if hybrid_loss:
+            self.grpo_loss = HybridGRPOLoss(
+                use_monte_carlo=True,
+                monte_carlo_warmup_steps=getattr(args, 'monte_carlo_warmup_steps', 1000),
+                **loss_kwargs
             )
+            logger.info("Using HybridGRPOLoss with Monte Carlo estimation")
+        elif monte_carlo_loss:
+            self.grpo_loss = MonteCarloGRPOLoss(**loss_kwargs)
+            logger.info("Using MonteCarloGRPOLoss")
+        elif adaptive_loss:
+            adaptive_kwargs = {
+                'initial_epsilon': getattr(args, 'epsilon', 0.2),
+                'initial_beta': max(getattr(args, 'beta', 0.05), 0.01),  # Ensure never 0
+                'final_epsilon': getattr(args, 'final_epsilon', 0.1),
+                'final_beta': max(getattr(args, 'final_beta', 0.02), 0.01),  # Ensure never 0
+                'total_steps': args.max_steps if hasattr(args, 'max_steps') else 10000
+            }
+            loss_kwargs.update(adaptive_kwargs)
+            self.grpo_loss = AdaptiveGRPOLoss(**loss_kwargs)
+            logger.info("Using AdaptiveGRPOLoss")
         else:
-            self.grpo_loss = GRPOLoss(
-                masking_strategy=self.masking_strategy,
-                memory_manager=self.memory_manager,
-                epsilon=getattr(args, 'epsilon', 0.2),
-                beta=getattr(args, 'beta', 0.04)
-            )
+            self.grpo_loss = GRPOLoss(**loss_kwargs)
+            logger.info("Using standard GRPOLoss")
         
         # Initialize reward function manager if using new reward functions
         if hasattr(args, 'dataset') and isinstance(reward_funcs, str):
@@ -150,6 +187,12 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
             'loss_computation_time': [],
             'memory_usage': [],
             'cache_hit_rates': []
+        }
+        
+        # Initialize metrics tracking
+        self._metrics = {
+            'train': {},
+            'eval': {}
         }
 
     @profiling_decorator
@@ -179,9 +222,15 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
         for metric_name, metric_value in metrics.items():
             if metric_name not in self._metrics[mode]:
                 self._metrics[mode][metric_name] = []
-            self._metrics[mode][metric_name].append(
-                self.accelerator.gather_for_metrics(torch.tensor(metric_value)).mean().item()
-            )
+            
+            # Ensure metric_value is a valid scalar and create tensor on correct device
+            if metric_value is not None and not (isinstance(metric_value, float) and np.isnan(metric_value)):
+                metric_tensor = torch.tensor(float(metric_value), device=self.accelerator.device, dtype=torch.float32)
+                gathered_metric = self.accelerator.gather_for_metrics(metric_tensor).mean().item()
+                self._metrics[mode][metric_name].append(gathered_metric)
+            else:
+                # Handle None or NaN values
+                self._metrics[mode][metric_name].append(0.0)
         
         return loss
 
@@ -301,20 +350,31 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
         all_old_per_token_logps = None
         all_ref_per_token_logps = None
         
+        # Always create expanded tensor when needed for logp computation
+        prompt_completion_ids_expanded = prompt_completion_ids.unsqueeze(0).expand(
+            self.num_iterations, -1, -1
+        )
+        
         with torch.no_grad():
             if self.num_iterations > 1:
-                prompt_completion_ids_expanded = prompt_completion_ids.unsqueeze(0).expand(
-                    self.num_iterations, -1, -1
-                )
-                all_old_per_token_logps = self.grpo_loss._compute_per_token_logps(
-                    self.model, prompt_completion_ids_expanded, logits_to_keep, mask_seeds.tolist()
-                )
+                # For old logprobs, we should use the current model, not ref_model
+                with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
+                    all_old_per_token_logps = self.grpo_loss._compute_per_token_logps(
+                        unwrapped_model, prompt_completion_ids_expanded, logits_to_keep, mask_seeds.tolist()
+                    )
 
             if self.beta > 0.0:
-                with self.accelerator.unwrap_model(self.model).disable_adapter():
+                if self.ref_model is not None:
                     all_ref_per_token_logps = self.grpo_loss._compute_per_token_logps(
-                        self.model, prompt_completion_ids_expanded, logits_to_keep, mask_seeds.tolist()
+                        self.ref_model, prompt_completion_ids_expanded, logits_to_keep, mask_seeds.tolist()
                     )
+                else:
+                    # When ref_model is None but PEFT is used, use model with disabled adapter
+                    with self.accelerator.unwrap_model(self.model).disable_adapter():
+                        with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
+                            all_ref_per_token_logps = self.grpo_loss._compute_per_token_logps(
+                                unwrapped_model, prompt_completion_ids_expanded, logits_to_keep, mask_seeds.tolist()
+                            )
 
         # Process completions for reward computation
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)

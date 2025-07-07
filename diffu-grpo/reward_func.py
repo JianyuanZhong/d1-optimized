@@ -4,9 +4,25 @@ from math500_utils import remove_boxed, last_boxed_only_string, is_equiv, boxed_
 
 
 def extract_xml_answer(text: str) -> str:
-    answer = text.split("<answer>")[-1]
-    answer = answer.split("</answer>")[0]
-    return answer.strip()
+    """Extract answer from XML tags, handling both plain text and boxed format."""
+    try:
+        answer = text.split("<answer>")[-1]
+        answer = answer.split("</answer>")[0]
+        answer = answer.strip()
+        
+        # If the answer contains \boxed{}, extract the content inside
+        if "\\boxed" in answer:
+            try:
+                answer = remove_boxed(last_boxed_only_string(answer))
+            except:
+                # If boxed extraction fails, try simple regex
+                boxed_match = re.search(r'\\boxed\{([^}]+)\}', answer)
+                if boxed_match:
+                    answer = boxed_match.group(1)
+        
+        return answer.strip()
+    except:
+        return ""
 
 
 def extract_hash_answer(text: str) -> str | None:
@@ -36,7 +52,17 @@ def correctness_reward_func(prompts, completions, answer, step=None, run_name=No
         "-" * 20,
         f"\n{YELLOW}Extracted:{RESET}\n{extracted_responses[0]}\n",
     )
-    return [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
+    
+    # Use mathematical equivalence check for better accuracy
+    rewards = []
+    for extracted, ground_truth in zip(extracted_responses, answer):
+        if is_equiv(extracted, ground_truth):
+            rewards.append(2.0)
+        else:
+            # Fallback to exact string match
+            rewards.append(2.0 if extracted == ground_truth else 0.0)
+    
+    return rewards
 
 
 def int_reward_func(completions, **kwargs) -> list[float]:
@@ -46,17 +72,53 @@ def int_reward_func(completions, **kwargs) -> list[float]:
 
 
 def strict_format_reward_func(completions, **kwargs) -> list[float]:
-    pattern = r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n$"
+    """Reward function for strict format: <reasoning>...</reasoning><answer>...</answer>"""
+    pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
     responses = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, r) for r in responses]
+    matches = [re.search(pattern, r, re.DOTALL) for r in responses]
     return [0.5 if match else 0.0 for match in matches]
 
 
 def soft_format_reward_func(completions, **kwargs) -> list[float]:
-    pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
+    """Reward function for soft format validation - checks for both reasoning and answer tags"""
     responses = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, r) for r in responses]
-    return [0.5 if match else 0.0 for match in matches]
+    rewards = []
+    
+    for r in responses:
+        reward = 0.0
+        # Check if both reasoning and answer tags are present
+        if "<reasoning>" in r and "</reasoning>" in r:
+            reward += 0.25
+        if "<answer>" in r and "</answer>" in r:
+            reward += 0.25
+        rewards.append(reward)
+    
+    return rewards
+
+
+def boxed_format_reward_func(completions, **kwargs) -> list[float]:
+    """Reward function specifically for boxed format within answer tags"""
+    responses = [completion[0]["content"] for completion in completions]
+    rewards = []
+    
+    for r in responses:
+        reward = 0.0
+        try:
+            # Extract content between answer tags
+            answer_content = r.split("<answer>")[1].split("</answer>")[0]
+            
+            # Check if it contains \boxed format
+            if "\\boxed{" in answer_content and "}" in answer_content:
+                reward += 0.5
+            elif "\\boxed" in answer_content:
+                reward += 0.25  # Partial credit for having \boxed but maybe malformed
+            
+        except (IndexError, ValueError):
+            pass
+        
+        rewards.append(reward)
+    
+    return rewards
 
 
 def count_xml(text) -> float:

@@ -159,7 +159,7 @@ class DiffuGRPOConfig(TrainingArguments):
         },
     )
     max_prompt_length: Optional[int] = field(
-        default=256,
+        default=128,
         metadata={
             "help": "Maximum length of the prompt. If the prompt is longer than this value, it will be truncated left."
         },
@@ -296,10 +296,10 @@ class DiffuGRPOConfig(TrainingArguments):
         },
     )
     beta: float = field(
-        default=0.04,
+        default=0.05,
         metadata={
-            "help": "KL coefficient. If `0.0`, the reference model is not loaded, reducing memory usage and improving "
-            "training speed, but may be numerically unstable for long training runs."
+            "help": "KL coefficient. Must be positive for numerical stability. If set too low, training may become "
+            "unstable. Recommended range: 0.01-0.1."
         },
     )
     num_iterations: int = field(
@@ -358,7 +358,7 @@ class DiffuGRPOConfig(TrainingArguments):
         metadata={"help": "diffusion block length"},
     )
     diffusion_steps: Optional[int] = field(
-        default=64,
+        default=128,
     )
     cfg_scale: Optional[float] = field(
         default=0.0,

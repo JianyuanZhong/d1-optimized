@@ -60,20 +60,20 @@ class DiffusionGenerator:
         num_blocks = gen_length // block_length
         steps_per_block = max(1, steps // num_blocks)
         
-        # Pre-compute number of transfer tokens for all blocks
-        transfer_tokens_schedule = self._precompute_transfer_schedule(
-            bs, block_length, steps_per_block, device
-        )
-        
         with self.memory_manager.managed_forward("generation"):
             for num_block in range(num_blocks):
                 start_idx = prompt.shape[1] + num_block * block_length
                 end_idx = prompt.shape[1] + (num_block + 1) * block_length
                 
+                # Pre-compute transfer tokens schedule for this block
+                transfer_tokens_schedule = self._precompute_transfer_schedule(
+                    bs, block_length, steps_per_block, device
+                )
+                
                 x = self._generate_block(
                     model, x, start_idx, end_idx, steps_per_block,
                     temperature, cfg_scale, remasking, mask_id,
-                    prompt_index, transfer_tokens_schedule[num_block], dtype
+                    prompt_index, transfer_tokens_schedule, dtype
                 )
         
         return x
@@ -98,16 +98,16 @@ class DiffusionGenerator:
             
             results.append(batch_result)
             
-            # Clean up intermediate results
+            # Clean up intermediate results without aggressive cache clearing
             if i > 0:  # Keep first batch for shape reference
-                batch_tensor_cleanup(batch_prompt)
+                batch_tensor_cleanup(batch_prompt, force_cache_clear=False)
         
         return torch.cat(results, dim=0)
     
     def _generate_block(self, model, x: torch.Tensor, start_idx: int, end_idx: int,
                        steps_per_block: int, temperature: float, cfg_scale: float,
                        remasking: str, mask_id: int, prompt_index: torch.Tensor,
-                       transfer_tokens_schedule: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+                       transfer_tokens_schedule: List[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
         """Generate a single block with optimized operations."""
         
         block_mask_index = x[:, start_idx:end_idx] == mask_id
@@ -133,8 +133,8 @@ class DiffusionGenerator:
                 x, x0, confidence, mask_index, transfer_tokens_schedule[step], step
             )
             
-            # Clean up intermediate tensors
-            batch_tensor_cleanup(logits, x0, confidence)
+            # Clean up intermediate tensors (no cache clearing for performance)
+            batch_tensor_cleanup(logits, x0, confidence, force_cache_clear=False)
         
         return x
     
@@ -155,8 +155,8 @@ class DiffusionGenerator:
             # Apply CFG
             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
             
-            # Clean up intermediate tensors
-            batch_tensor_cleanup(un_x, combined_input, combined_logits, un_logits)
+            # Clean up intermediate tensors (no cache clearing for performance)
+            batch_tensor_cleanup(un_x, combined_input, combined_logits, un_logits, force_cache_clear=False)
         else:
             logits = model(x).logits
         
@@ -173,7 +173,7 @@ class DiffusionGenerator:
         logits_with_noise = self._add_gumbel_noise(logits, temperature, dtype)
         x0 = torch.argmax(logits_with_noise, dim=-1)
         
-        batch_tensor_cleanup(logits_with_noise)
+        batch_tensor_cleanup(logits_with_noise, force_cache_clear=False)
         return x0
     
     def _add_gumbel_noise(self, logits: torch.Tensor, temperature: float,
@@ -195,7 +195,7 @@ class DiffusionGenerator:
             confidence = torch.squeeze(
                 torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
             )
-            batch_tensor_cleanup(p)
+            batch_tensor_cleanup(p, force_cache_clear=False)
         elif remasking == "random":
             confidence = torch.rand_like(x0, dtype=dtype)
         else:
@@ -218,11 +218,21 @@ class DiffusionGenerator:
         # Select tokens to transfer based on confidence
         transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
         
-        for j in range(confidence.shape[0]):
-            num_tokens = num_transfer_tokens[j].item()
-            if num_tokens > 0:
-                _, select_index = torch.topk(confidence[j], k=num_tokens)
-                transfer_index[j, select_index] = True
+        # Handle both scalar and tensor cases for num_transfer_tokens
+        if num_transfer_tokens.dim() == 0:
+            # 0-dimensional tensor (scalar) - same number of tokens for all batch elements
+            num_tokens = num_transfer_tokens.item()
+            for j in range(confidence.shape[0]):
+                if num_tokens > 0:
+                    _, select_index = torch.topk(confidence[j], k=num_tokens)
+                    transfer_index[j, select_index] = True
+        else:
+            # 1-dimensional tensor - different number of tokens per batch element
+            for j in range(confidence.shape[0]):
+                num_tokens = num_transfer_tokens[j].item()
+                if num_tokens > 0:
+                    _, select_index = torch.topk(confidence[j], k=num_tokens)
+                    transfer_index[j, select_index] = True
         
         # Update selected tokens
         x[transfer_index] = x0[transfer_index]
@@ -245,6 +255,10 @@ class DiffusionGenerator:
             num_transfer = base_tokens.squeeze(-1)
             if step < remainder.max().item():
                 num_transfer += (step < remainder.squeeze(-1)).long()
+            
+            # Ensure we always have at least 1D tensor even for batch_size=1
+            if num_transfer.dim() == 0:
+                num_transfer = num_transfer.unsqueeze(0)
             
             schedule.append(num_transfer)
         

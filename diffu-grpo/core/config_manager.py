@@ -56,7 +56,7 @@ class GenerationConfig:
 class LossConfig:
     """Configuration for GRPO loss computation."""
     epsilon: float = 0.2
-    beta: float = 0.04
+    beta: float = 0.05  # Increased from 0.04 to ensure non-zero default
     adaptive_loss: bool = False
     
     # Adaptive loss settings
@@ -139,8 +139,8 @@ class ImprovedDiffuGRPOConfig:
         if self.loss.epsilon <= 0:
             errors.append("epsilon must be positive")
         
-        if self.loss.beta < 0:
-            errors.append("beta must be non-negative")
+        if self.loss.beta <= 0:
+            errors.append("beta must be positive (cannot be 0 for numerical stability)")
         
         if self.loss.adaptive_loss:
             if any(x is None for x in [self.loss.initial_epsilon, self.loss.final_epsilon, 

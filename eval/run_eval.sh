@@ -6,7 +6,8 @@ GPU_IDS=(0 1 2 3 4 5 6 7)
 MASTER_PORT=29411
 
 # Arrays of tasks and generation lengths
-TASKS=("countdown" "sudoku" "math" "gsm8k")
+# TASKS=("countdown" "sudoku" "math" "gsm8k")
+TASKS=("gsm8k")
 GEN_LENGTHS=(128 256)
 
 # Set GPU IDs from command line if provided
@@ -41,7 +42,7 @@ for task in "${TASKS[@]}"; do
       --batch_size $batch_size \
       --gen_length $gen_length \
       --output_dir "eval_results" \
-      --model_path "/data0/shared/LLaDA-8B-Instruct/"
+      --model_path "/home/ndfl4zki/ndfl4zkiuser07/jyzhong/diffusion_LM/d1-optimized/diffu-grpo/checkpoints/gsm8k_mc_monte_carlo_balanced/merged_model"
   done
 done
 

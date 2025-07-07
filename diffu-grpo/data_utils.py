@@ -23,15 +23,14 @@ def set_random_seed(seed: int = 42):
 
 
 # Constants for prompts
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT = """You are a math expert. You will be given a question to solve. Solve it step by step. Wrap the final answer in a \\boxed{}. 
 Respond in the following format:
 <reasoning>
-...
+Your reasoning here
 </reasoning>
 <answer>
-...
-</answer>
-"""
+\\boxed{...}
+</answer>"""
 
 SUDOKU_SYSTEM_PROMPT = """
 Please solve the following 4x4 Sudoku puzzle. The puzzle is provided as a 16-character string reading left-to-right, top-to-bottom, where '0' represents empty cells.

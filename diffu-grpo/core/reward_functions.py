@@ -47,7 +47,8 @@ class RewardFunction(ABC):
             
             if result.success:
                 self._success_count += 1
-                if self.enable_logging and np.random.random() < self.log_probability:
+                # Log reward details occasionally to monitor performance
+                if self.enable_logging and (self._success_count % max(1, int(1/self.log_probability))) == 0:
                     self._log_reward_details(prompts, completions, result, **kwargs)
                 return result.rewards
             else:
@@ -58,14 +59,26 @@ class RewardFunction(ABC):
         except Exception as e:
             self._error_count += 1
             logger.error(f"Reward function {self.name} crashed: {str(e)}")
+            # Return zero rewards for all completions on error
             return [0.0] * len(completions)
     
     def _log_reward_details(self, prompts: List[Any], completions: List[Any], 
                            result: RewardOutput, **kwargs):
         """Log detailed reward computation information."""
-        logger.info(f"[{self.name}] Rewards: {result.rewards[:3]}...")
+        # Focus on reward statistics rather than individual completions
+        avg_reward = np.mean(result.rewards) if result.rewards else 0.0
+        max_reward = max(result.rewards) if result.rewards else 0.0
+        min_reward = min(result.rewards) if result.rewards else 0.0
+        
+        logger.info(f"[{self.name}] Reward Stats - Avg: {avg_reward:.3f}, Max: {max_reward:.3f}, Min: {min_reward:.3f}")
         if result.metadata:
-            logger.info(f"[{self.name}] Metadata: {result.metadata}")
+            # Only log key metadata, not everything
+            key_metrics = {}
+            for key, value in result.metadata.items():
+                if key in ['accuracy', 'correct_count', 'match_count', 'avg_score']:
+                    key_metrics[key] = value
+            if key_metrics:
+                logger.info(f"[{self.name}] Metrics: {key_metrics}")
     
     def get_stats(self) -> Dict[str, Any]:
         """Get reward function statistics."""
@@ -86,35 +99,20 @@ class FormatRewardFunction(RewardFunction):
         super().__init__(name, **kwargs)
         self.pattern = pattern
         self.reward_value = reward_value
-        self.compiled_pattern = re.compile(pattern)
     
     def compute_reward(self, prompts: List[Any], completions: List[Any], 
                       **kwargs) -> RewardOutput:
-        """Compute format-based rewards."""
+        """Compute format-based rewards - faithful to original."""
         try:
-            responses = self._extract_responses(completions)
-            rewards = []
-            matches = []
-            
-            for response in responses:
-                if not isinstance(response, str):
-                    rewards.append(0.0)
-                    matches.append(False)
-                    continue
-                
-                match = self.compiled_pattern.search(response)
-                if match:
-                    rewards.append(self.reward_value)
-                    matches.append(True)
-                else:
-                    rewards.append(0.0)
-                    matches.append(False)
+            responses = [completion[0]["content"] for completion in completions]
+            matches = [re.match(self.pattern, r) for r in responses]
+            rewards = [0.5 if match else 0.0 for match in matches]
             
             return RewardOutput(
                 rewards=rewards,
                 metadata={
                     'pattern': self.pattern,
-                    'match_count': sum(matches),
+                    'match_count': sum(1 for m in matches if m),
                     'total_count': len(responses)
                 },
                 success=True
@@ -172,33 +170,14 @@ class XMLCountRewardFunction(RewardFunction):
     
     def compute_reward(self, prompts: List[Any], completions: List[Any], 
                       **kwargs) -> RewardOutput:
-        """Compute XML count-based rewards."""
+        """Compute XML count-based rewards - faithful to original."""
         try:
-            responses = self._extract_responses(completions)
-            rewards = []
-            
-            for response in responses:
-                if not isinstance(response, str):
-                    rewards.append(0.0)
-                    continue
-                
-                count = 0.0
-                if response.count("<reasoning>\n") == 1:
-                    count += 0.125
-                if response.count("\n</reasoning>\n") == 1:
-                    count += 0.125
-                if response.count("\n<answer>\n") == 1:
-                    count += 0.125
-                    count -= len(response.split("\n</answer>\n")[-1]) * 0.001
-                if response.count("\n</answer>") == 1:
-                    count += 0.125
-                    count -= (len(response.split("\n</answer>")[-1]) - 1) * 0.001
-                
-                rewards.append(count)
+            contents = [completion[0]["content"] for completion in completions]
+            rewards = [self._count_xml(c) for c in contents]
             
             return RewardOutput(
                 rewards=rewards,
-                metadata={'avg_count': np.mean(rewards)},
+                metadata={'avg_count': np.mean(rewards) if rewards else 0.0},
                 success=True
             )
             
@@ -209,6 +188,21 @@ class XMLCountRewardFunction(RewardFunction):
                 success=False,
                 error_message=str(e)
             )
+    
+    def _count_xml(self, text: str) -> float:
+        """Count XML tags - faithful to original count_xml function."""
+        count = 0.0
+        if text.count("<reasoning>\n") == 1:
+            count += 0.125
+        if text.count("\n</reasoning>\n") == 1:
+            count += 0.125
+        if text.count("\n<answer>\n") == 1:
+            count += 0.125
+            count -= len(text.split("\n</answer>\n")[-1]) * 0.001
+        if text.count("\n</answer>") == 1:
+            count += 0.125
+            count -= (len(text.split("\n</answer>")[-1]) - 1) * 0.001
+        return count
     
     def _extract_responses(self, completions: List[Any]) -> List[str]:
         """Extract response strings from completions."""
@@ -233,20 +227,20 @@ class CorrectnessRewardFunction(RewardFunction):
     
     def compute_reward(self, prompts: List[Any], completions: List[Any], 
                       answer: List[str], **kwargs) -> RewardOutput:
-        """Compute correctness-based rewards."""
+        """Compute correctness-based rewards - faithful to original."""
         try:
-            responses = self._extract_responses(completions)
+            responses = [completion[0]["content"] for completion in completions]
+            q = prompts[0][-1]["content"]
             extracted_responses = [self._extract_xml_answer(r) for r in responses]
+
+            # Sample one completion for detailed logging (reduce noise)
+            if self.enable_logging and np.random.random() < 0.1:  # 10% chance
+                logger.debug(f"[{self.name}] Sample - Ground truth: {answer[0][:50]}...")
+                logger.debug(f"[{self.name}] Sample - Extracted: {extracted_responses[0][:50]}...")
+                logger.debug(f"[{self.name}] Sample - Correct: {extracted_responses[0] == answer[0]}")
             
-            rewards = []
-            correct_count = 0
-            
-            for extracted, expected in zip(extracted_responses, answer):
-                if extracted == expected:
-                    rewards.append(self.correct_reward)
-                    correct_count += 1
-                else:
-                    rewards.append(0.0)
+            rewards = [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
+            correct_count = sum(1 for r in rewards if r > 0.0)
             
             return RewardOutput(
                 rewards=rewards,
@@ -280,13 +274,47 @@ class CorrectnessRewardFunction(RewardFunction):
         return responses
     
     def _extract_xml_answer(self, text: str) -> str:
-        """Extract answer from XML tags."""
+        """Extract answer from XML tags, handling both plain text and boxed format."""
         try:
             answer = text.split("<answer>")[-1]
             answer = answer.split("</answer>")[0]
+            answer = answer.strip()
+            
+            # If the answer contains \boxed{}, extract the content inside
+            if "\\boxed" in answer:
+                try:
+                    # Import here to avoid circular imports
+                    from math500_utils import remove_boxed, last_boxed_only_string
+                    answer = remove_boxed(last_boxed_only_string(answer))
+                except:
+                    # If boxed extraction fails, try simple regex
+                    import re
+                    boxed_match = re.search(r'\\boxed\{([^}]+)\}', answer)
+                    if boxed_match:
+                        answer = boxed_match.group(1)
+            
             return answer.strip()
         except:
             return ""
+    
+    def _is_valid_answer_format(self, extracted_answer: str) -> bool:
+        """Check if the extracted answer has a valid format."""
+        if not extracted_answer:
+            return False
+        
+        # Basic validation: non-empty, reasonable length
+        if len(extracted_answer.strip()) == 0:
+            return False
+        
+        # For sudoku-like tasks, check if it contains reasonable content
+        if len(extracted_answer) > 1000:  # Too long
+            return False
+        
+        # Contains some alphanumeric content
+        if not any(c.isalnum() for c in extracted_answer):
+            return False
+        
+        return True
 
 
 class IntegerRewardFunction(RewardFunction):
@@ -298,24 +326,16 @@ class IntegerRewardFunction(RewardFunction):
     
     def compute_reward(self, prompts: List[Any], completions: List[Any], 
                       **kwargs) -> RewardOutput:
-        """Compute integer format rewards."""
+        """Compute integer format rewards - faithful to original."""
         try:
-            responses = self._extract_responses(completions)
-            rewards = []
-            integer_count = 0
-            
-            for response in responses:
-                extracted = self._extract_xml_answer(response)
-                if extracted.isdigit():
-                    rewards.append(self.reward_value)
-                    integer_count += 1
-                else:
-                    rewards.append(0.0)
+            responses = [completion[0]["content"] for completion in completions]
+            extracted_responses = [self._extract_xml_answer(r) for r in responses]
+            rewards = [0.5 if r.isdigit() else 0.0 for r in extracted_responses]
             
             return RewardOutput(
                 rewards=rewards,
                 metadata={
-                    'integer_count': integer_count,
+                    'integer_count': sum(1 for r in rewards if r > 0.0),
                     'total_count': len(responses)
                 },
                 success=True
@@ -343,10 +363,25 @@ class IntegerRewardFunction(RewardFunction):
         return responses
     
     def _extract_xml_answer(self, text: str) -> str:
-        """Extract answer from XML tags."""
+        """Extract answer from XML tags, handling both plain text and boxed format."""
         try:
             answer = text.split("<answer>")[-1]
             answer = answer.split("</answer>")[0]
+            answer = answer.strip()
+            
+            # If the answer contains \boxed{}, extract the content inside
+            if "\\boxed" in answer:
+                try:
+                    # Import here to avoid circular imports
+                    from math500_utils import remove_boxed, last_boxed_only_string
+                    answer = remove_boxed(last_boxed_only_string(answer))
+                except:
+                    # If boxed extraction fails, try simple regex
+                    import re
+                    boxed_match = re.search(r'\\boxed\{([^}]+)\}', answer)
+                    if boxed_match:
+                        answer = boxed_match.group(1)
+            
             return answer.strip()
         except:
             return ""
@@ -459,6 +494,133 @@ class CountdownRewardFunction(RewardFunction):
             return None
 
 
+class SudokuRewardFunction(RewardFunction):
+    """Reward function for sudoku task validation - faithful to original implementation."""
+    
+    def __init__(self, **kwargs):
+        super().__init__(name="sudoku", **kwargs)
+    
+    def compute_reward(self, prompts: List[Any], completions: List[Any], 
+                      **kwargs) -> RewardOutput:
+        """Compute sudoku rewards faithful to original sudoku_reward_func."""
+        try:
+            # Extract responses same way as original
+            if (isinstance(completions[0], list) and 
+                isinstance(completions[0][0], dict) and 
+                "content" in completions[0][0]):
+                responses = [completion[0]["content"] for completion in completions]
+            else:
+                responses = completions
+            
+            scores = []
+            for i, response in enumerate(responses):
+                puzzle = kwargs["puzzle"][i]
+                ground_truth = kwargs["solution"][i]
+                solution = self._extract_answer_sudoku(response)
+                
+                score = 0.0 if solution is None else self._validate_sudoku_solution(solution, ground_truth, puzzle)
+                scores.append(score)
+                
+                # Sample logging for debugging (reduce noise)
+                if self.enable_logging and np.random.random() < 0.05:  # 5% chance
+                    logger.debug(f"[{self.name}] Sample - Puzzle length: {len(puzzle)}")
+                    logger.debug(f"[{self.name}] Sample - Solution length: {len(solution) if solution else 0}")
+                    logger.debug(f"[{self.name}] Sample - Score: {score:.4f}")
+            
+            return RewardOutput(
+                rewards=scores,
+                metadata={
+                    'avg_score': np.mean(scores) if scores else 0.0,
+                    'total_count': len(responses)
+                },
+                success=True
+            )
+            
+        except Exception as e:
+            return RewardOutput(
+                rewards=[0.0] * len(completions),
+                metadata={},
+                success=False,
+                error_message=str(e)
+            )
+    
+    def _extract_answer_sudoku(self, solution_str: str) -> Optional[str]:
+        """Extract answer from sudoku solution - faithful to original."""
+        answer_pattern = r"<answer>(.*?)</answer>"
+        matches = re.findall(answer_pattern, solution_str, re.DOTALL)
+        if matches:
+            return "".join(char for char in matches[-1].strip() if char.isdigit())
+        return None
+    
+    def _validate_sudoku_solution(self, solution_str: str, ground_truth: str, puzzle: str) -> float:
+        """Validate sudoku solution - faithful to original."""
+        if solution_str is None or len(solution_str) == 0:
+            return 0.0
+
+        if len(solution_str) < 16:
+            # Pad with zeros if too short
+            solution_str = solution_str + "0" * (16 - len(solution_str))
+        elif len(solution_str) > 16:
+            # Truncate if too long
+            solution_str = solution_str[:16]
+
+        empty_indices = [i for i in range(16) if puzzle[i] == "0"]
+
+        if empty_indices:
+            correct_cells = sum(1 for i in empty_indices if solution_str[i] == ground_truth[i])
+            return correct_cells / len(empty_indices)
+        return 0.0
+
+
+class BoxedFormatRewardFunction(RewardFunction):
+    """Reward function specifically for boxed format within answer tags."""
+    
+    def __init__(self, reward_value: float = 0.5, **kwargs):
+        super().__init__(name="boxed_format", **kwargs)
+        self.reward_value = reward_value
+    
+    def compute_reward(self, prompts: List[Any], completions: List[Any], 
+                      **kwargs) -> RewardOutput:
+        """Compute boxed format rewards."""
+        try:
+            responses = [completion[0]["content"] for completion in completions]
+            rewards = []
+            
+            for r in responses:
+                reward = 0.0
+                try:
+                    # Extract content between answer tags
+                    answer_content = r.split("<answer>")[1].split("</answer>")[0]
+                    
+                    # Check if it contains \boxed format
+                    if "\\boxed{" in answer_content and "}" in answer_content:
+                        reward += self.reward_value
+                    elif "\\boxed" in answer_content:
+                        reward += self.reward_value * 0.5  # Partial credit for having \boxed but maybe malformed
+                    
+                except (IndexError, ValueError):
+                    pass
+                
+                rewards.append(reward)
+            
+            return RewardOutput(
+                rewards=rewards,
+                metadata={
+                    'boxed_count': sum(1 for r in rewards if r > 0.0),
+                    'total_count': len(responses)
+                },
+                success=True
+            )
+            
+        except Exception as e:
+            return RewardOutput(
+                rewards=[0.0] * len(completions),
+                metadata={},
+                success=False,
+                error_message=str(e)
+            )
+
+
 class RewardFunctionManager:
     """Manager for multiple reward functions."""
     
@@ -492,6 +654,17 @@ class RewardFunctionManager:
         else:
             combined_rewards = [0.0] * len(completions)
         
+        # Log combined reward statistics occasionally
+        if hasattr(self, '_call_count'):
+            self._call_count += 1
+        else:
+            self._call_count = 1
+            
+        if self._call_count % 50 == 0:  # Log every 50 calls
+            avg_reward = np.mean(combined_rewards) if combined_rewards else 0.0
+            max_reward = max(combined_rewards) if combined_rewards else 0.0
+            logger.info(f"[RewardManager] Combined reward stats - Avg: {avg_reward:.3f}, Max: {max_reward:.3f}")
+        
         return combined_rewards, all_metadata
     
     def get_stats(self) -> Dict[str, Any]:
@@ -503,25 +676,26 @@ class RewardFunctionManager:
 
 
 # Factory functions for backward compatibility
-def create_reward_functions(dataset: str) -> List[RewardFunction]:
-    """Create reward functions for a given dataset."""
+def create_reward_functions(dataset: str, enable_logging: bool = True, log_probability: float = 0.1) -> List[RewardFunction]:
+    """Create reward functions for a given dataset with configurable logging."""
     if dataset == "gsm8k":
         return [
-            XMLCountRewardFunction(weight=1.0),
-            XMLFormatRewardFunction(weight=1.0),
-            StrictXMLFormatRewardFunction(weight=1.0),
-            IntegerRewardFunction(weight=1.0),
-            CorrectnessRewardFunction(weight=1.0),
+            XMLFormatRewardFunction(weight=1.0, enable_logging=enable_logging, log_probability=log_probability),
+            StrictXMLFormatRewardFunction(weight=1.0, enable_logging=enable_logging, log_probability=log_probability),
+            BoxedFormatRewardFunction(weight=1.0, enable_logging=enable_logging, log_probability=log_probability),
+            CorrectnessRewardFunction(weight=1.0, enable_logging=enable_logging, log_probability=log_probability),
         ]
     elif dataset == "countdown":
-        return [CountdownRewardFunction(weight=1.0)]
+        return [CountdownRewardFunction(weight=1.0, enable_logging=enable_logging, log_probability=log_probability)]
     elif dataset == "sudoku":
-        # Placeholder for sudoku reward function
-        return [CorrectnessRewardFunction(weight=1.0)]
+        return [
+            XMLFormatRewardFunction(weight=0.5, enable_logging=enable_logging, log_probability=log_probability),
+            SudokuRewardFunction(weight=1.0, enable_logging=enable_logging, log_probability=log_probability),
+        ]
     elif dataset == "math":
         return [
-            CorrectnessRewardFunction(weight=1.0),
-            XMLFormatRewardFunction(weight=0.5),
+            CorrectnessRewardFunction(weight=1.0, enable_logging=enable_logging, log_probability=log_probability),
+            BoxedFormatRewardFunction(weight=0.5, enable_logging=enable_logging, log_probability=log_probability),
         ]
     else:
         raise ValueError(f"Unknown dataset: {dataset}")

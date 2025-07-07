@@ -52,7 +52,7 @@ def parse_gsm_answers(json_path=None, json_data=None):
                         numbers = re.findall(r"-?\d+\.?\d*", boxed_content)
                         if numbers:
                             try:
-                                parsed_answer = float(numbers[0])
+                                parsed_answer = float(numbers[-1])
                                 break
                             except ValueError:
                                 pass
@@ -438,4 +438,4 @@ def aggregate_results(directory="."):
 
 
 if __name__ == "__main__":
-    aggregate_results(directory="eval_baselines")
+    aggregate_results(directory="eval_results")
