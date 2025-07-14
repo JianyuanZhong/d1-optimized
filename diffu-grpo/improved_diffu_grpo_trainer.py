@@ -10,7 +10,23 @@ from trl.trainer.grpo_config import GRPOConfig
 from trl.extras.profiling import profiling_decorator, profiling_context
 from transformers.utils import is_peft_available
 from torch import nn
-from trl.import_utils import is_rich_available, is_vllm_available
+try:
+    from trl.import_utils import is_rich_available, is_vllm_available
+except ImportError:
+    # Fallback for older TRL versions
+    def is_rich_available():
+        try:
+            import rich
+            return True
+        except ImportError:
+            return False
+    
+    def is_vllm_available():
+        try:
+            import vllm
+            return True
+        except ImportError:
+            return False
 from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
@@ -28,7 +44,7 @@ import pandas as pd
 from core.memory_manager import MemoryManager
 from core.diffusion_generator import DiffusionGenerator
 from core.masking_strategy import create_masking_strategy, DiffusionMaskingStrategy
-from core.grpo_loss import GRPOLoss, AdaptiveGRPOLoss, MonteCarloGRPOLoss, HybridGRPOLoss
+from core.grpo_loss import GRPOLoss, MonteCarloGRPOLoss, TrajectoryAwareGRPOLoss
 from core.reward_functions import RewardFunctionManager, create_reward_functions
 from core.tensor_ops import TensorOpsOptimizer, MemoryEfficientOperations
 
@@ -81,9 +97,8 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
         peft_config: Optional["PeftConfig"] = None,
         enable_profiling: bool = False,
         masking_strategy: str = "diffusion",
-        adaptive_loss: bool = False,
         monte_carlo_loss: bool = False,
-        hybrid_loss: bool = False,
+        trajectory_aware_grpo_loss: bool = False,
     ):
         # Ensure beta is never 0 - override parent class setting
         self.beta = max(getattr(args, 'beta', 0.04), 0.01)
@@ -111,12 +126,14 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
         )
         self.tensor_ops = TensorOpsOptimizer(device=self.accelerator.device)
         
-        # Initialize masking strategy
-        self.masking_strategy = create_masking_strategy(
-            masking_strategy,
-            p_mask_prompt=getattr(args, 'p_mask_prompt', 0.3),
-            cache_size=1000
-        )
+        # Initialize masking strategy with alpha schedule parameters for consistency
+        masking_kwargs = {
+            'p_mask_prompt': getattr(args, 'p_mask_prompt', 0.3),
+            'cache_size': 1000
+        }
+        
+        
+        self.masking_strategy = create_masking_strategy(masking_strategy, **masking_kwargs)
         
         # Initialize diffusion generator
         self.diffusion_generator = DiffusionGenerator(
@@ -134,7 +151,7 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
         }
         
         # Add Monte Carlo specific parameters
-        if monte_carlo_loss or hybrid_loss:
+        if monte_carlo_loss:
             loss_kwargs.update({
                 'mc_num': getattr(args, 'mc_num', 128),  # Keep for accuracy
                 'mc_batch_size': getattr(args, 'mc_batch_size', 8),  # Reduced from 16 to 8 for memory
@@ -142,31 +159,27 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
                 'mask_id': getattr(args, 'mask_id', 126336)
             })
         
+        
+        # Add Trajectory-Aware GRPO specific parameters
+        if trajectory_aware_grpo_loss:
+            loss_kwargs.update({
+                'importance_weight_normalization': getattr(args, 'importance_weight_normalization', 'softmax'),
+                'per_step_kl_penalty': getattr(args, 'per_step_kl_penalty', True),
+                'numerical_stability_eps': getattr(args, 'numerical_stability_eps', 1e-8),
+                'max_importance_weight': getattr(args, 'max_importance_weight', 10.0)
+            })
+        
         # Initialize the appropriate loss class
-        if hybrid_loss:
-            self.grpo_loss = HybridGRPOLoss(
-                use_monte_carlo=True,
-                monte_carlo_warmup_steps=getattr(args, 'monte_carlo_warmup_steps', 1000),
-                **loss_kwargs
-            )
-            logger.info("Using HybridGRPOLoss with Monte Carlo estimation")
+        if trajectory_aware_grpo_loss:
+            self.grpo_loss = TrajectoryAwareGRPOLoss(**loss_kwargs)
+            logger.info("Using TrajectoryAwareGRPOLoss with trajectory-aware reinforcement learning")
         elif monte_carlo_loss:
             self.grpo_loss = MonteCarloGRPOLoss(**loss_kwargs)
             logger.info("Using MonteCarloGRPOLoss")
-        elif adaptive_loss:
-            adaptive_kwargs = {
-                'initial_epsilon': getattr(args, 'epsilon', 0.2),
-                'initial_beta': max(getattr(args, 'beta', 0.05), 0.01),  # Ensure never 0
-                'final_epsilon': getattr(args, 'final_epsilon', 0.1),
-                'final_beta': max(getattr(args, 'final_beta', 0.02), 0.01),  # Ensure never 0
-                'total_steps': args.max_steps if hasattr(args, 'max_steps') else 10000
-            }
-            loss_kwargs.update(adaptive_kwargs)
-            self.grpo_loss = AdaptiveGRPOLoss(**loss_kwargs)
-            logger.info("Using AdaptiveGRPOLoss")
         else:
             self.grpo_loss = GRPOLoss(**loss_kwargs)
             logger.info("Using standard GRPOLoss")
+        
         
         # Initialize reward function manager if using new reward functions
         if hasattr(args, 'dataset') and isinstance(reward_funcs, str):
@@ -198,6 +211,11 @@ class ImprovedDiffuGRPOTrainer(GRPOTrainer):
         
         # Initialize logging configuration
         self.log_completions = getattr(args, 'log_completions', True)
+    
+    def update_vocab_size_from_tokenizer(self, tokenizer):
+        """Update vocabulary size if needed by loss class."""
+        # Only TrajectoryAwareGRPOLoss may need vocab size updates in the future
+        pass
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):

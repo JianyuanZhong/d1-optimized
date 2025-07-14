@@ -1,0 +1,63 @@
+# Configuration for training with Trajectory-aware NELBO loss on GSM8K dataset
+# This demonstrates the discrete diffusion NELBO method for better log probability estimation
+
+# Basic model and dataset configuration
+model_path: "microsoft/DialoGPT-medium"  # Replace with your model path
+dataset: "gsm8k"
+run_name: "trajectory_nelbo_gsm8k"
+output_dir: "checkpoints/trajectory_nelbo_gsm8k"
+num_epochs: 2
+num_iterations: 4
+
+# Generation settings (aligned with NELBO timesteps)
+generation:
+  steps: 128                 # Number of diffusion timesteps T (should match NELBO max_timesteps)
+  block_length: 64          # Generation block size
+  temperature: 0.0          # Generation temperature
+  cfg_scale: 0.0           # Classifier-free guidance scale
+  remasking: "low_confidence"
+  mask_id: 126336
+
+# Masking strategy (consistent with NELBO forward process)
+masking:
+  strategy_type: "diffusion"  # Use DiffusionMaskingStrategy for consistency
+  p_mask_prompt: 0.3         # Prompt masking probability
+
+# Loss configuration - Enable Trajectory NELBO
+loss:
+  epsilon: 0.2              # PPO clipping parameter
+  beta: 0.04               # KL regularization coefficient
+  adaptive_loss: false     # Disable adaptive loss
+  monte_carlo_loss: false  # Disable Monte Carlo loss
+  hybrid_loss: false       # Disable hybrid loss
+  trajectory_nelbo_loss: true  # ENABLE trajectory-aware NELBO loss
+  
+  # Trajectory NELBO specific parameters
+  trajectory_samples: 4     # Number of trajectory samples for NELBO estimation
+  alpha_schedule: "cosine"  # Noise schedule: "cosine", "linear", "exponential"
+  alpha_min: 0.01          # Minimum α value (maximum noise)
+  alpha_max: 0.99          # Maximum α value (minimum noise)
+  prior_type: "uniform"    # Prior distribution π: "uniform" or "mask_focused"
+  # vocab_size: auto-detected from tokenizer
+
+# Optimization settings
+optimization:
+  enable_mixed_precision: true     # Use mixed precision for memory efficiency
+  enable_gradient_checkpointing: true
+  enable_profiling: false
+  generation_batch_size: 2         # Reduced for memory efficiency with NELBO
+  per_device_train_batch_size: 1   # Small batch size for NELBO computation
+  memory_cache_interval: 10        # More frequent cache clearing for NELBO
+
+# Reward function configuration
+reward:
+  use_new_rewards: true           # Use modular reward functions
+  enable_logging: true
+  log_probability: false
+  correct_reward: 1.0
+  format_reward: 0.1
+
+# Performance and logging
+enable_performance_logging: true
+performance_log_interval: 50
+save_performance_stats: true

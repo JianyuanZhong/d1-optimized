@@ -329,6 +329,17 @@ def create_trainer_config(config: ImprovedDiffuGRPOConfig, model_config: ModelCo
         beta=config.loss.beta,
         p_mask_prompt=config.masking.p_mask_prompt,
         
+        # Advanced loss parameters (if using NELBO) - ensure consistency with masking
+        trajectory_samples=getattr(config, 'trajectory_samples', 4),
+        alpha_schedule=getattr(config, 'alpha_schedule', 'cosine'),
+        alpha_min=getattr(config, 'alpha_min', 0.01),
+        alpha_max=getattr(config, 'alpha_max', 0.99),
+        prior_type=getattr(config, 'prior_type', 'uniform'),
+        vocab_size=getattr(config, 'vocab_size', 32000),  # Will be overridden with actual tokenizer size
+        
+        # Ensure diffusion_steps matches max_timesteps for consistency
+        max_timesteps=config.generation.steps,  # Use generation steps as max timesteps
+        
         # Optimization settings
         fp16=config.optimization.enable_mixed_precision and not torch.cuda.is_bf16_supported(),
         bf16=config.optimization.enable_mixed_precision and torch.cuda.is_bf16_supported(),
@@ -416,6 +427,18 @@ def load_yaml_config(yaml_path: str, logger: logging.Logger) -> ImprovedDiffuGRP
     if 'loss' in config_dict:
         loss = config_dict['loss']
         config.loss.adaptive_loss = loss.get('adaptive_loss', config.loss.adaptive_loss)
+        config.loss.monte_carlo_loss = loss.get('monte_carlo_loss', False)
+        config.loss.hybrid_loss = loss.get('hybrid_loss', False)
+        config.loss.trajectory_nelbo_loss = loss.get('trajectory_nelbo_loss', False)
+        
+        # NELBO-specific parameters
+        if config.loss.trajectory_nelbo_loss:
+            config.trajectory_samples = loss.get('trajectory_samples', 4)
+            config.alpha_schedule = loss.get('alpha_schedule', 'cosine')
+            config.alpha_min = loss.get('alpha_min', 0.01)
+            config.alpha_max = loss.get('alpha_max', 0.99)
+            config.prior_type = loss.get('prior_type', 'uniform')
+            config.vocab_size = loss.get('vocab_size', 32000)
     
     # Reward settings
     if 'reward' in config_dict:
@@ -508,6 +531,13 @@ def main():
     # Set up model and tokenizer
     model, tokenizer = setup_model_and_tokenizer(improved_config, model_config, logger)
     
+    # Infer vocabulary size from tokenizer for NELBO loss
+    if getattr(improved_config.loss, 'trajectory_nelbo_loss', False):
+        vocab_size = len(tokenizer)
+        logger.info(f"📚 Inferred vocabulary size from tokenizer: {vocab_size:,}")
+        # Update config with actual vocab size
+        improved_config.vocab_size = vocab_size
+    
     # Load dataset
     train_dataset, eval_dataset = load_dataset(improved_config, logger)
     
@@ -517,7 +547,7 @@ def main():
     # Set up PEFT configuration
     peft_config = setup_peft_config(model_config, logger)
     
-    # Create trainer configuration
+    # Create trainer configuration (after vocab size is inferred)
     trainer_config = create_trainer_config(improved_config, model_config, output_dir, len(train_dataset), logger)
     
     # Initialize improved trainer
@@ -533,7 +563,15 @@ def main():
         enable_profiling=improved_config.optimization.enable_profiling,
         masking_strategy=improved_config.masking.strategy_type,
         adaptive_loss=improved_config.loss.adaptive_loss,
+        monte_carlo_loss=getattr(improved_config.loss, 'monte_carlo_loss', False),
+        hybrid_loss=getattr(improved_config.loss, 'hybrid_loss', False),
+        trajectory_nelbo_loss=getattr(improved_config.loss, 'trajectory_nelbo_loss', False),
     )
+    
+    # Update vocabulary size from tokenizer if using TrajectoryNELBOLoss
+    if getattr(improved_config.loss, 'trajectory_nelbo_loss', False):
+        trainer.update_vocab_size_from_tokenizer(tokenizer)
+        logger.info("✓ TrajectoryNELBOLoss vocabulary size updated from tokenizer")
     
     # Set up performance monitoring
     if getattr(improved_config, 'enable_performance_logging', False):

@@ -385,3 +385,25 @@ class DiffuGRPOConfig(TrainingArguments):
         default=True,
         metadata={"help": "Whether to randomly mask tokens."},
     )
+    
+    # Trajectory-Aware GRPO parameters
+    trajectory_aware_grpo_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether to use trajectory-aware GRPO loss with importance weighting and outcome supervision."},
+    )
+    importance_weight_normalization: str = field(
+        default="softmax",
+        metadata={"help": "Normalization strategy for importance weights: 'softmax', 'clamp', 'normalize', or 'none'."},
+    )
+    per_step_kl_penalty: bool = field(
+        default=True,
+        metadata={"help": "Whether to apply KL penalty per-step in trajectory-aware reward calculation."},
+    )
+    numerical_stability_eps: float = field(
+        default=1e-8,
+        metadata={"help": "Epsilon value for numerical stability in trajectory-aware calculations."},
+    )
+    max_importance_weight: float = field(
+        default=10.0,
+        metadata={"help": "Maximum value for importance weights to prevent extreme values."},
+    )

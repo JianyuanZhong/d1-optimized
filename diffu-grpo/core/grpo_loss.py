@@ -113,9 +113,20 @@ class GRPOLoss:
         
         for iter_idx, mask_seed in enumerate(mask_seeds):
             original_input = input_ids[iter_idx]
-            masked_input, _ = self.masking_strategy.forward_process(
-                original_input, prompt_index, mask_id=126336, seed=mask_seed
-            )
+            # Use consistent timestep for masking (sample based on iteration for reproducibility)
+            timestep = (iter_idx + 1) * (getattr(self, 'max_timesteps', 128) // num_iterations)
+            timestep = max(1, min(timestep, getattr(self, 'max_timesteps', 128)))
+            
+            # Check if masking strategy supports timestep parameter
+            if hasattr(self.masking_strategy, 'alpha_t'):
+                masked_input, _ = self.masking_strategy.forward_process(
+                    original_input, prompt_index, mask_id=126336, seed=mask_seed, timestep=timestep
+                )
+            else:
+                # Fallback to standard masking without timestep
+                masked_input, _ = self.masking_strategy.forward_process(
+                    original_input, prompt_index, mask_id=126336, seed=mask_seed
+                )
             all_masked_inputs.append(masked_input)
             all_original_inputs.append(original_input)
         
@@ -171,8 +182,6 @@ class GRPOLoss:
         else:
             # For first iteration, use current logps (detached)
             return current_logps.detach()
-    
-
     
     def _compute_kl_loss(self, inputs: Dict[str, torch.Tensor], 
                         iteration_idx: int, current_logps: torch.Tensor,
@@ -233,67 +242,6 @@ class GRPOLoss:
             stats['masking_cache_stats'] = self.masking_strategy.get_cache_stats()
         
         return stats
-
-
-class AdaptiveGRPOLoss(GRPOLoss):
-    """GRPO loss with adaptive hyperparameters."""
-    
-    def __init__(self, masking_strategy: MaskingStrategy,
-                 memory_manager: Optional[MemoryManager] = None,
-                 initial_epsilon: float = 0.2, final_epsilon: float = 0.1,
-                 initial_beta: float = 0.04, final_beta: float = 0.01,
-                 total_steps: int = 10000, **kwargs):
-        super().__init__(masking_strategy, memory_manager, initial_epsilon, initial_beta, **kwargs)
-        
-        self.initial_epsilon = initial_epsilon
-        self.final_epsilon = final_epsilon
-        self.initial_beta = initial_beta
-        self.final_beta = final_beta
-        self.total_steps = total_steps
-        self.current_step = 0
-    
-    def update_step(self, step: int):
-        """Update current step and adapt hyperparameters."""
-        
-        self.current_step = step
-        
-        # Adaptive epsilon
-        if step < self.total_steps:
-            progress = step / self.total_steps
-            self.epsilon = self.initial_epsilon + (self.final_epsilon - self.initial_epsilon) * progress
-            self.beta = self.initial_beta + (self.final_beta - self.initial_beta) * progress
-        else:
-            self.epsilon = self.final_epsilon
-            self.beta = self.final_beta
-
-
-class MultiObjectiveGRPOLoss(GRPOLoss):
-    """GRPO loss with multiple objectives (e.g., reward + length penalty)."""
-    
-    def __init__(self, masking_strategy: MaskingStrategy,
-                 memory_manager: Optional[MemoryManager] = None,
-                 length_penalty_weight: float = 0.01,
-                 **kwargs):
-        super().__init__(masking_strategy, memory_manager, **kwargs)
-        self.length_penalty_weight = length_penalty_weight
-    
-    def compute_loss(self, model, inputs: Dict[str, torch.Tensor], 
-                    iteration_idx: int, num_iterations: int) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute multi-objective GRPO loss."""
-        
-        # Get standard GRPO loss
-        base_loss, metrics = super().compute_loss(model, inputs, iteration_idx, num_iterations)
-        
-        # Add length penalty
-        completion_mask = inputs["completion_mask"]
-        length_penalty = completion_mask.sum(dim=1).float().mean()
-        
-        total_loss = base_loss + self.length_penalty_weight * length_penalty
-        
-        metrics['length_penalty'] = length_penalty.item()
-        metrics['base_loss'] = base_loss.item()
-        
-        return total_loss, metrics
 
 
 class MonteCarloGRPOLoss(GRPOLoss):
@@ -516,9 +464,6 @@ class MonteCarloGRPOLoss(GRPOLoss):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
-                # Clear memory manager cache if available
-                if hasattr(self, 'memory_manager') and self.memory_manager is not None:
-                    self.memory_manager.cleanup_batch_tensors()
         
         # Return average negative log-likelihood (positive value)
         if total_samples > 0:
@@ -607,8 +552,6 @@ class MonteCarloGRPOLoss(GRPOLoss):
         with self.memory_manager.managed_forward("monte_carlo_logps"):
             return self._compute_per_token_logps_mc(model, input_ids, logits_to_keep, mask_seeds)
     
-
-    
     def update_mc_params(self, mc_num: Optional[int] = None, mc_batch_size: Optional[int] = None,
                         cfg_scale: Optional[float] = None, mc_num_old_logps: Optional[int] = None):
         """Update Monte Carlo parameters during training."""
@@ -652,85 +595,438 @@ class MonteCarloGRPOLoss(GRPOLoss):
         return stats
 
 
-class HybridGRPOLoss(GRPOLoss):
-    """Hybrid GRPO loss that can switch between standard and Monte Carlo estimation."""
+class TrajectoryAwareGRPOLoss(GRPOLoss):
+    """
+    Trajectory-Aware Group Relative Policy Optimization (GRPO) Loss for LLaDA/RADD Models.
+    
+    Implements the trajectory-aware reinforcement learning approach with:
+    1. On-Policy Data Generation with per-step information storage
+    2. Trajectory-Aware Reward Calculation with importance weights
+    3. Advantage Calculation using outcome supervision
+    4. Policy Update using GRPO objective
+    
+    This approach adapts the "Reward - Penalty" RL scheme to diffusion models using 
+    per-step credit assignment based on intrinsic loss from NELBO calculations.
+    """
     
     def __init__(self, masking_strategy: MaskingStrategy,
                  memory_manager: Optional[MemoryManager] = None,
-                 use_monte_carlo: bool = True,
-                 monte_carlo_warmup_steps: int = 1000,
+                 importance_weight_normalization: str = "softmax",
+                 per_step_kl_penalty: bool = True,
+                 numerical_stability_eps: float = 1e-8,
+                 max_importance_weight: float = 10.0,
                  **kwargs):
         super().__init__(masking_strategy, memory_manager, **kwargs)
         
-        # Initialize Monte Carlo component
-        if use_monte_carlo:
-            self.mc_loss = MonteCarloGRPOLoss(
-                masking_strategy=masking_strategy,
-                memory_manager=memory_manager,
-                **kwargs  # This includes ref_model for consistency
+        self.importance_weight_normalization = importance_weight_normalization
+        self.per_step_kl_penalty = per_step_kl_penalty
+        self.numerical_stability_eps = numerical_stability_eps
+        self.max_importance_weight = max_importance_weight
+        
+        # Storage for trajectory information
+        self._trajectory_data = {}
+        
+        logger.info(f"Initialized TrajectoryAwareGRPOLoss with {importance_weight_normalization} importance weighting")
+    
+    def compute_loss(self, model, inputs: Dict[str, torch.Tensor], 
+                    iteration_idx: int, num_iterations: int) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute trajectory-aware GRPO loss following the 4-step algorithm:
+        1. On-Policy Data Generation (store per-step info)
+        2. Trajectory-Aware Reward Calculation
+        3. Advantage Calculation (outcome supervision)
+        4. Policy Update
+        """
+        
+        with self.memory_manager.managed_forward("trajectory_aware_grpo_loss"):
+            # Step 1: On-Policy Data Generation - Store per-step information
+            trajectory_data = self._step1_data_generation(model, inputs, iteration_idx, num_iterations)
+            
+            # Step 2: Trajectory-Aware Reward Calculation
+            trajectory_rewards, per_step_rewards = self._step2_trajectory_reward_calculation(
+                inputs, trajectory_data, iteration_idx
+            )
+            
+            # Step 3: Advantage Calculation (Outcome Supervision)
+            advantages = self._step3_advantage_calculation(trajectory_rewards)
+            
+            # Step 4: Policy Update using GRPO objective
+            loss, metrics = self._step4_policy_update(
+                model, inputs, trajectory_data, advantages, iteration_idx, num_iterations
+            )
+            
+            # Add trajectory-specific metrics
+            trajectory_metrics = self._compute_trajectory_metrics(
+                trajectory_rewards, per_step_rewards, advantages, trajectory_data
+            )
+            metrics.update(trajectory_metrics)
+            
+            return loss, metrics
+    
+    def _step1_data_generation(self, model, inputs: Dict[str, torch.Tensor], 
+                             iteration_idx: int, num_iterations: int) -> Dict[str, torch.Tensor]:
+        """
+        Step 1: On-Policy Data Generation with per-step information storage.
+        
+        Store:
+        - Per-step intrinsic loss l_t(o_i) from NELBO calculation
+        - Per-step log probabilities for current and reference policies
+        """
+        
+        # Extract inputs
+        prompt_ids = inputs["prompt_ids"]
+        completion_ids = inputs["completion_ids"] 
+        completion_mask = inputs["completion_mask"]
+        mask_seeds = inputs["mask_seeds"]
+        
+        # Combine prompt and completion
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        logits_to_keep = completion_ids.size(1)
+        
+        # Get current iteration mask seed
+        current_mask_seed = mask_seeds[iteration_idx].item()
+        
+        # Compute per-step intrinsic loss using NELBO-like calculation
+        per_step_intrinsic_loss = self._compute_per_step_intrinsic_loss(
+            model, input_ids, logits_to_keep, current_mask_seed
+        )
+        
+        # Compute current log probabilities
+        current_logps = self._compute_per_token_logps(
+            model, input_ids.unsqueeze(0), logits_to_keep, [current_mask_seed]
+        ).squeeze(0)
+        
+        # Get reference log probabilities
+        ref_logps = self._get_reference_logps(inputs, iteration_idx, current_logps)
+        
+        # Store trajectory data
+        trajectory_data = {
+            'per_step_intrinsic_loss': per_step_intrinsic_loss,
+            'current_logps': current_logps,
+            'ref_logps': ref_logps,
+            'completion_mask': completion_mask
+        }
+        
+        return trajectory_data
+    
+    def _step2_trajectory_reward_calculation(self, inputs: Dict[str, torch.Tensor],
+                                           trajectory_data: Dict[str, torch.Tensor],
+                                           iteration_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Step 2: Trajectory-Aware Reward Calculation.
+        
+        Calculate:
+        - Importance weights: w_t(o_i) = l_t(o_i) / L_total(o_i)
+        - Per-step rewards: r_t(o_i) = w_t(o_i) * r_ext,i - β * KL_penalty
+        - Final trajectory reward: r_i = Σ_t r_t(o_i)
+        """
+        
+        # Get external rewards (from trainer's advantage calculation)
+        external_rewards = inputs["advantages"]  # This contains the external rewards
+        per_step_intrinsic_loss = trajectory_data['per_step_intrinsic_loss']
+        current_logps = trajectory_data['current_logps']
+        ref_logps = trajectory_data['ref_logps']
+        completion_mask = trajectory_data['completion_mask']
+        
+        # Calculate total intrinsic loss for each trajectory
+        total_intrinsic_loss = (per_step_intrinsic_loss * completion_mask).sum(dim=1, keepdim=True)
+        
+        # Calculate importance weights: w_t(o_i) = l_t(o_i) / L_total(o_i)
+        importance_weights = self._calculate_importance_weights(
+            per_step_intrinsic_loss, total_intrinsic_loss, completion_mask
+        )
+        
+        # Calculate per-step rewards
+        per_step_rewards = self._calculate_per_step_rewards(
+            importance_weights, external_rewards, current_logps, ref_logps, completion_mask
+        )
+        
+        # Calculate final trajectory reward: r_i = Σ_t r_t(o_i)
+        trajectory_rewards = (per_step_rewards * completion_mask).sum(dim=1)
+        
+        return trajectory_rewards, per_step_rewards
+    
+    def _step3_advantage_calculation(self, trajectory_rewards: torch.Tensor) -> torch.Tensor:
+        """
+        Step 3: Advantage Calculation using outcome supervision.
+        
+        Calculate: Â_i,t = (r_i - μ_R) / σ_R
+        
+        This advantage is constant for all timesteps within a trajectory,
+        directly comparing the total quality of trajectory i to its peers.
+        """
+        
+        # Handle edge cases and ensure numerical stability
+        if trajectory_rewards.numel() == 0:
+            logger.warning("Empty trajectory rewards, returning zero advantages")
+            return torch.zeros_like(trajectory_rewards)
+        
+        # Check for invalid values in trajectory rewards
+        invalid_rewards = torch.isnan(trajectory_rewards) | torch.isinf(trajectory_rewards)
+        if invalid_rewards.any():
+            logger.warning(f"Found {invalid_rewards.sum().item()} invalid trajectory rewards, replacing with mean")
+            valid_rewards = trajectory_rewards[~invalid_rewards]
+            if valid_rewards.numel() > 0:
+                replacement_value = valid_rewards.mean()
+            else:
+                replacement_value = torch.tensor(0.0, device=trajectory_rewards.device)
+            trajectory_rewards = torch.where(invalid_rewards, replacement_value, trajectory_rewards)
+        
+        # Normalize trajectory rewards across the group with numerical stability
+        mean_reward = trajectory_rewards.mean()
+        std_reward = trajectory_rewards.std(unbiased=False)  # Use population std for stability
+        
+        # Ensure standard deviation is not too small
+        if std_reward < self.numerical_stability_eps:
+            logger.warning(f"Very small std_reward ({std_reward:.2e}), using uniform advantages")
+            advantages = torch.zeros_like(trajectory_rewards)
+        else:
+            std_reward = std_reward + self.numerical_stability_eps
+            advantages = (trajectory_rewards - mean_reward) / std_reward
+            
+            # Clamp advantages to prevent extreme values
+            max_advantage = 10.0  # Reasonable bound for advantages
+            advantages = torch.clamp(advantages, -max_advantage, max_advantage)
+        
+        return advantages
+    
+    def _step4_policy_update(self, model, inputs: Dict[str, torch.Tensor],
+                           trajectory_data: Dict[str, torch.Tensor],
+                           advantages: torch.Tensor,
+                           iteration_idx: int, num_iterations: int) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Step 4: Policy Update using GRPO objective.
+        
+        The KL penalty is already incorporated into the rewards during Step 2,
+        so we use the GRPO objective without the explicit KL term.
+        """
+        
+        # Extract data
+        current_logps = trajectory_data['current_logps']
+        completion_mask = trajectory_data['completion_mask']
+        
+        # Get old log probabilities (for PPO-style updates)
+        old_logps = self._get_old_logps(inputs, iteration_idx, current_logps)
+        
+        # Compute policy ratio
+        ratio = torch.exp(current_logps - old_logps)
+        
+        # Expand advantages to match sequence length (constant per trajectory)
+        advantages_expanded = advantages.unsqueeze(1).expand_as(current_logps)
+        
+        # Compute clipped loss
+        clipped_ratio = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon)
+        policy_loss1 = ratio * advantages_expanded
+        policy_loss2 = clipped_ratio * advantages_expanded
+        policy_loss = -torch.min(policy_loss1, policy_loss2)
+        
+        # Compute final loss (masked by completion tokens only)
+        loss = (policy_loss * completion_mask).sum() / completion_mask.sum()
+        
+        # Compute metrics
+        metrics = self._compute_metrics(policy_loss1, policy_loss2, completion_mask, torch.zeros_like(policy_loss))
+        
+        return loss, metrics
+    
+    def _compute_per_step_intrinsic_loss(self, model, input_ids: torch.Tensor,
+                                       logits_to_keep: int, mask_seed: int) -> torch.Tensor:
+        """
+        Compute per-step intrinsic loss l_t(o_i) from NELBO-like calculation.
+        
+        This represents the negative log-probability contribution of each step
+        in the diffusion denoising process.
+        """
+        
+        batch_size, seq_len = input_ids.size()
+        device = input_ids.device
+        prompt_length = seq_len - logits_to_keep
+        
+        # Set up prompt indexing
+        prompt_index = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        prompt_index[:prompt_length] = True
+        
+        # Use consistent timestep for masking
+        timestep = max(1, min(mask_seed % getattr(self, 'max_timesteps', 128), 
+                             getattr(self, 'max_timesteps', 128)))
+        
+        # Apply masking process
+        if hasattr(self.masking_strategy, 'alpha_t'):
+            masked_input, _ = self.masking_strategy.forward_process(
+                input_ids, prompt_index, mask_id=126336, seed=mask_seed, timestep=timestep
             )
         else:
-            self.mc_loss = None
+            masked_input, _ = self.masking_strategy.forward_process(
+                input_ids, prompt_index, mask_id=126336, seed=mask_seed
+            )
         
-        self.use_monte_carlo = use_monte_carlo
-        self.monte_carlo_warmup_steps = monte_carlo_warmup_steps
-        self.current_step = 0
+        # Forward pass to get logits
+        if self.enable_mixed_precision:
+            with torch.cuda.amp.autocast():
+                logits = model(masked_input).logits
+        else:
+            logits = model(masked_input).logits
+        
+        # Compute per-step intrinsic loss (negative log-likelihood)
+        completion_logits = logits[:, -logits_to_keep:, :]
+        completion_targets = input_ids[:, -logits_to_keep:]
+        
+        # Compute cross-entropy loss per token
+        flat_logits = completion_logits.reshape(-1, completion_logits.size(-1))
+        flat_targets = completion_targets.reshape(-1)
+        
+        per_token_loss = F.cross_entropy(flat_logits, flat_targets, reduction='none')
+        per_step_intrinsic_loss = per_token_loss.reshape(batch_size, logits_to_keep)
+        
+        return per_step_intrinsic_loss
+    
+    def _calculate_importance_weights(self, per_step_intrinsic_loss: torch.Tensor,
+                                    total_intrinsic_loss: torch.Tensor,
+                                    completion_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Calculate importance weights: w_t(o_i) = l_t(o_i) / L_total(o_i)
+        
+        Includes normalization options for numerical stability.
+        """
+        
+        # Handle edge cases for numerical stability
+        total_intrinsic_loss = torch.clamp(total_intrinsic_loss, min=self.numerical_stability_eps)
+        
+        # Calculate raw importance weights with numerical stability
+        raw_weights = per_step_intrinsic_loss / (total_intrinsic_loss + self.numerical_stability_eps)
+        
+        # Check for invalid values and replace with uniform weights
+        invalid_mask = torch.isnan(raw_weights) | torch.isinf(raw_weights)
+        if invalid_mask.any():
+            logger.warning(f"Found {invalid_mask.sum().item()} invalid importance weights, replacing with uniform")
+            uniform_weight = 1.0 / completion_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+            raw_weights = torch.where(invalid_mask, uniform_weight, raw_weights)
+        
+        # Apply normalization strategy with memory optimization
+        if self.importance_weight_normalization == "softmax":
+            # Softmax normalization across sequence with temperature for stability
+            temperature = 1.0
+            weights = F.softmax(raw_weights / temperature, dim=1)
+        elif self.importance_weight_normalization == "clamp":
+            # Simple clamping with bounds checking
+            weights = torch.clamp(raw_weights, 0.0, self.max_importance_weight)
+        elif self.importance_weight_normalization == "normalize":
+            # L1 normalization per trajectory with stability
+            weight_sum = raw_weights.sum(dim=1, keepdim=True)
+            weight_sum = torch.clamp(weight_sum, min=self.numerical_stability_eps)
+            weights = raw_weights / weight_sum
+        else:
+            # No normalization but still apply bounds
+            weights = torch.clamp(raw_weights, 0.0, float('inf'))
+        
+        # Ensure weights are masked properly and handle zero-mask case
+        weights = weights * completion_mask
+        
+        # Final safety check: if all weights are zero, use uniform
+        zero_weight_trajectories = (weights.sum(dim=1) == 0)
+        if zero_weight_trajectories.any():
+            logger.warning(f"Found {zero_weight_trajectories.sum().item()} trajectories with zero weights")
+            uniform_weight = completion_mask.float() / completion_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+            weights[zero_weight_trajectories] = uniform_weight[zero_weight_trajectories]
+        
+        return weights
+    
+    def _calculate_per_step_rewards(self, importance_weights: torch.Tensor,
+                                  external_rewards: torch.Tensor,
+                                  current_logps: torch.Tensor,
+                                  ref_logps: torch.Tensor,
+                                  completion_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Calculate per-step rewards: r_t(o_i) = w_t(o_i) * r_ext,i - β * KL_penalty
+        """
+        
+        # Reward component: importance-weighted external reward
+        reward_component = importance_weights * external_rewards.unsqueeze(1)
+        
+        # KL penalty component (per-step)
+        if self.per_step_kl_penalty and self.beta > 0.0:
+            kl_penalty = self.beta * (current_logps - ref_logps)
+            penalty_component = kl_penalty
+        else:
+            penalty_component = torch.zeros_like(current_logps)
+        
+        # Combine reward and penalty
+        per_step_rewards = reward_component - penalty_component
+        
+        # Mask to completion tokens only
+        per_step_rewards = per_step_rewards * completion_mask
+        
+        return per_step_rewards
+    
+    def _get_reference_logps(self, inputs: Dict[str, torch.Tensor], 
+                           iteration_idx: int, current_logps: torch.Tensor) -> torch.Tensor:
+        """Get reference log probabilities for KL penalty calculation."""
+        
+        if "ref_per_token_logps" in inputs and inputs["ref_per_token_logps"] is not None:
+            return inputs["ref_per_token_logps"][iteration_idx].squeeze(0)
+        else:
+            # No reference model, use current logps (detached)
+            return current_logps.detach()
+    
+    def _compute_trajectory_metrics(self, trajectory_rewards: torch.Tensor,
+                                  per_step_rewards: torch.Tensor,
+                                  advantages: torch.Tensor,
+                                  trajectory_data: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """Compute trajectory-specific metrics for monitoring."""
+        
+        completion_mask = trajectory_data['completion_mask']
+        importance_weights = per_step_rewards / (trajectory_rewards.unsqueeze(1) + self.numerical_stability_eps)
+        
+        metrics = {
+            'trajectory_reward_mean': trajectory_rewards.mean().item(),
+            'trajectory_reward_std': trajectory_rewards.std().item(),
+            'advantage_mean': advantages.mean().item(),
+            'advantage_std': advantages.std().item(),
+            'importance_weight_max': (importance_weights * completion_mask).max().item(),
+            'importance_weight_mean': (importance_weights * completion_mask).sum().item() / completion_mask.sum().item(),
+            'per_step_reward_mean': (per_step_rewards * completion_mask).sum().item() / completion_mask.sum().item()
+        }
+        
+        return metrics
     
     def update_step(self, step: int):
-        """Update current step for adaptive behavior."""
-        self.current_step = step
-        if hasattr(self, 'mc_loss') and self.mc_loss is not None:
-            if hasattr(self.mc_loss, 'update_step'):
-                self.mc_loss.update_step(step)
+        """Update current training step for potential future adaptive behavior."""
+        # This method is required by the trainer interface
+        # Currently no adaptive behavior implemented, but available for future use
+        pass
     
-
-    
-    def update_mc_params(self, **kwargs):
-        """Update Monte Carlo parameters and sync with mc_loss component."""
-        if self.mc_loss is not None:
-            self.mc_loss.update_mc_params(**kwargs)
-    
-    def _should_use_monte_carlo(self) -> bool:
-        """Determine whether to use Monte Carlo estimation."""
-        if not self.use_monte_carlo or self.mc_loss is None:
-            return False
+    def update_trajectory_params(self, importance_weight_normalization: Optional[str] = None,
+                               per_step_kl_penalty: Optional[bool] = None,
+                               max_importance_weight: Optional[float] = None):
+        """Update trajectory-specific parameters during training."""
         
-        # Use Monte Carlo after warmup period
-        return self.current_step >= self.monte_carlo_warmup_steps
-    
-    def _compute_per_token_logps(self, model, input_ids: torch.Tensor, 
-                               logits_to_keep: int, mask_seeds: List[int]) -> torch.Tensor:
-        """Choose between standard and Monte Carlo estimation.
+        if importance_weight_normalization is not None:
+            self.importance_weight_normalization = importance_weight_normalization
+            logger.info(f"Updated importance_weight_normalization to {importance_weight_normalization}")
         
-        This method ensures that both current and old log probabilities use
-        the same estimation method (either both standard or both Monte Carlo).
-        """
-        if self._should_use_monte_carlo():
-            return self.mc_loss._compute_per_token_logps(model, input_ids, logits_to_keep, mask_seeds)
-        else:
-            return super()._compute_per_token_logps(model, input_ids, logits_to_keep, mask_seeds)
-    
-    def _verify_estimation_consistency(self) -> bool:
-        """Verify that current and old logps use the same estimation method."""
-        use_mc = self._should_use_monte_carlo()
-        if use_mc and self.mc_loss is None:
-            logger.warning("Should use Monte Carlo but mc_loss is None")
-            return False
+        if per_step_kl_penalty is not None:
+            self.per_step_kl_penalty = per_step_kl_penalty
+            logger.info(f"Updated per_step_kl_penalty to {per_step_kl_penalty}")
         
-        return True
+        if max_importance_weight is not None:
+            self.max_importance_weight = max_importance_weight
+            logger.info(f"Updated max_importance_weight to {max_importance_weight}")
+    
+    def clear_trajectory_cache(self):
+        """Clear trajectory data cache to free memory."""
+        self._trajectory_data.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     def get_performance_stats(self) -> Dict[str, Any]:
-        """Get performance statistics for hybrid approach."""
+        """Get performance statistics including trajectory-specific parameters."""
+        
         stats = super().get_performance_stats()
         stats.update({
-            'use_monte_carlo': self.use_monte_carlo,
-            'monte_carlo_warmup_steps': self.monte_carlo_warmup_steps,
-            'current_step': self.current_step,
-            'using_monte_carlo': self._should_use_monte_carlo(),
-            'estimation_consistent': self._verify_estimation_consistency()
+            'importance_weight_normalization': self.importance_weight_normalization,
+            'per_step_kl_penalty': self.per_step_kl_penalty,
+            'numerical_stability_eps': self.numerical_stability_eps,
+            'max_importance_weight': self.max_importance_weight,
+            'trajectory_cache_size': len(self._trajectory_data)
         })
-        
-        if self.mc_loss is not None:
-            stats['monte_carlo_stats'] = self.mc_loss.get_performance_stats()
         
         return stats

@@ -1,0 +1,77 @@
+# Configuration for training with Trajectory-Aware GRPO loss on GSM8K dataset
+# This demonstrates the trajectory-aware reinforcement learning approach with
+# importance weighting and outcome supervision for LLaDA/RADD models
+
+# Basic model and dataset configuration
+model_path: "microsoft/DialoGPT-medium"  # Replace with your model path
+dataset: "gsm8k"
+run_name: "trajectory_aware_grpo_gsm8k"
+output_dir: "checkpoints/trajectory_aware_grpo_gsm8k"
+num_epochs: 2
+num_iterations: 4
+
+# Generation settings
+generation:
+  steps: 128                 # Number of diffusion timesteps
+  block_length: 64          # Generation block size
+  temperature: 0.0          # Generation temperature
+  cfg_scale: 0.0           # Classifier-free guidance scale
+  remasking: "low_confidence"
+  mask_id: 126336
+
+# Masking strategy
+masking:
+  strategy_type: "diffusion"  # Use DiffusionMaskingStrategy
+  p_mask_prompt: 0.3         # Prompt masking probability
+
+# Loss configuration - Enable Trajectory-Aware GRPO
+loss:
+  epsilon: 0.2              # PPO clipping parameter
+  beta: 0.04               # KL regularization coefficient
+  adaptive_loss: false     # Disable adaptive loss
+  monte_carlo_loss: false  # Disable Monte Carlo loss
+  hybrid_loss: false       # Disable hybrid loss
+  trajectory_nelbo_loss: false    # Disable trajectory NELBO loss
+  trajectory_aware_grpo_loss: true  # ENABLE trajectory-aware GRPO loss
+  
+  # Trajectory-Aware GRPO specific parameters
+  importance_weight_normalization: "softmax"  # Options: "softmax", "clamp", "normalize", "none"
+  per_step_kl_penalty: true                  # Apply KL penalty per-step
+  numerical_stability_eps: 1e-8              # Numerical stability epsilon
+  max_importance_weight: 10.0                # Maximum importance weight value
+
+# Optimization settings
+optimization:
+  enable_mixed_precision: true     # Use mixed precision for memory efficiency
+  enable_gradient_checkpointing: true
+  enable_profiling: false
+  generation_batch_size: 2         # Reduced for memory efficiency
+  per_device_train_batch_size: 1   # Small batch size for trajectory computation
+  memory_cache_interval: 10        # More frequent cache clearing
+
+# Reward function configuration
+reward:
+  use_new_rewards: true           # Use modular reward functions
+  enable_logging: true
+  log_probability: 0.1            # Log 10% of reward computations for monitoring
+  correct_reward: 1.0
+  format_reward: 0.1
+
+# Performance and logging
+enable_performance_logging: true
+performance_log_interval: 50
+save_performance_stats: true
+
+# Additional training parameters
+learning_rate: 1e-6
+gradient_accumulation_steps: 4
+max_steps: 1000
+logging_steps: 50
+save_steps: 250
+eval_steps: 250
+warmup_steps: 100
+
+# Memory optimization
+fp16: true                        # Use mixed precision
+remove_unused_columns: false     # Keep all columns for reward functions
+dataloader_num_workers: 2
